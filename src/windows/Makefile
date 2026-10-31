@@ -11,7 +11,7 @@ $(BIN):
 	mkdir -p $(BIN)
 
 $(BIN)/diatweaks.dll: diatweaks.c tweak.c tweak.h winrt_ids.h | $(BIN)
-	$(MINGW) $(CFLAGS) -shared -o $@ diatweaks.c tweak.c -lole32 -lshell32 -luser32 -luuid
+	$(MINGW) $(CFLAGS) -shared -o $@ diatweaks.c tweak.c -lole32 -loleaut32 -lshell32 -luser32 -luuid
 
 $(BIN)/diawrap.exe: diawrap.c | $(BIN)
 	$(MINGW) $(CFLAGS) -o $@ diawrap.c -luser32 -lshell32

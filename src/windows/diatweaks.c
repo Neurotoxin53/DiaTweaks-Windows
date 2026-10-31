@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#include <oaidl.h>
 
 #include "tweak.h"
 #include "winrt_ids.h"
@@ -35,9 +36,20 @@ static const GUID IID_UNK = {0, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
 static const GUID IID_INSPECT = {0xAF86E2E0, 0xB12D, 0x4C6A, {0x9C, 0x5A, 0xD7, 0xAA, 0x65, 0x10, 0x1E, 0x90}};
 /* IContentIslandStatics in Dia 1.4.0.424's Microsoft.UI.winmd. FindAllForCurrentThread is slot 8. */
 static const GUID IID_ISLAND_STATICS = {0x7B9EB7CC, 0x8C43, 0x5E0A, {0xAB, 0x23, 0xAB, 0x48, 0x62, 0x8F, 0xD2, 0x23}};
+static const GUID IID_WINDOW = {0x61F0EC79, 0x5D52, 0x56B5, {0x86, 0xFB, 0x40, 0xFA, 0x4A, 0xF2, 0x88, 0xB0}};
+static const GUID IID_WINDOW_STATICS = {0x8CC985E3, 0xA41A, 0x5DF4, {0xB5, 0x31, 0xD3, 0xA1, 0x78, 0x8D, 0x86, 0xC5}};
+static const GUID IID_WINDOW_NATIVE = {0xEECDBF0E, 0xBAE9, 0x4CB6, {0xA6, 0x8E, 0x95, 0x98, 0xE1, 0xCB, 0x57, 0xBB}};
+static const GUID IID_XAML_ROOT = {0x60CB215A, 0xAD15, 0x520A, {0x8B, 0x01, 0x44, 0x16, 0x82, 0x4F, 0x04, 0x41}};
+static const GUID IID_XAML_ISLAND = {0x845A5C62, 0xB0F3, 0x5DB8, {0xB4, 0xFF, 0x41, 0x42, 0xBB, 0xD8, 0xA0, 0x44}};
+static const GUID IID_DWXS = {0x553AF92C, 0x1381, 0x51D6, {0xBE, 0xE0, 0xF3, 0x4B, 0xEB, 0x04, 0x2E, 0xA8}};
+static const GUID IID_FRAG = {0xF7063DA8, 0x8359, 0x439C, {0x92, 0x97, 0xBB, 0xC5, 0x29, 0x9A, 0x7D, 0x87}};
 #define VT_ISLAND_FIND_ALL 8
+#define VT_ISLAND_GET_APPDATA 7
+#define VT_ISLAND_GET_PROPS 10
 #define VT_ISLAND_GET_ID 13
 #define VT_ISLAND_GET_PROVIDER 25
+#define VT_WINDOW_GET_CONTENT 8
+#define VT_HOST_GET_CONTENT 6
 
 typedef long (*FnRoInit)(int);
 typedef long (*FnActivate)(HSTRING, const GUID *, void **);
@@ -58,6 +70,7 @@ static int g_sta;
 static HMODULE g_module;
 static CRITICAL_SECTION g_log_lock;
 static FILE *g_log;
+static wchar_t g_log_path[MAX_PATH];
 static HWND g_timer_hwnd;
 static volatile HWND g_pending;
 static HHOOK g_hook;
@@ -91,6 +104,26 @@ static TweakSettings g_settings;
 static int g_tick;
 static int g_logged_root;
 static int g_have_root;
+static int g_detail;
+static int g_dumped;
+static int g_peer_unsupported;
+static int g_ndump;
+static int g_discover_attempts;
+static int g_discover_paused;
+static DWORD g_discover_gap;
+static DWORD g_last_discover;
+static DWORD g_discover_start;
+static HWND g_known_tops[16];
+static int g_known_top_n;
+#define MAX_DUMP 100
+typedef struct DumpEl {
+    char name[96];
+    char cls[80];
+    char target[24];
+    double w, h;
+} DumpEl;
+static DumpEl g_dump[MAX_DUMP];
+static char g_dump_sig[8192];
 static int g_named_logs;
 static void *g_island_factory;
 static int g_logged_api;
@@ -112,23 +145,25 @@ static void *qi(void *obj, const GUID *iid) {
     return out;
 }
 
+static void log_open(void) {
+    if (g_log) return;
+    wchar_t root[MAX_PATH], dir[MAX_PATH];
+    if (!local_appdata(root, MAX_PATH)) return;
+    _snwprintf(dir, MAX_PATH, L"%s\\DiaPatches", root);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(g_log_path, MAX_PATH, L"%s\\diatweaks.log", dir);
+    g_log = _wfopen(g_log_path, L"a");
+}
+
 static void log_line(const char *text) {
     EnterCriticalSection(&g_log_lock);
-    if (!g_log) {
-        wchar_t root[MAX_PATH], dir[MAX_PATH], path[MAX_PATH];
-        dir[0] = 0;
-        if (local_appdata(root, MAX_PATH)) _snwprintf(dir, MAX_PATH, L"%s\\DiaPatches", root);
-        if (dir[0]) {
-            CreateDirectoryW(dir, NULL);
-            _snwprintf(path, MAX_PATH, L"%s\\diatweaks.log", dir);
-            g_log = _wfopen(path, L"a");
-            if (g_log) {
-                fseek(g_log, 0, SEEK_END);
-                if (ftell(g_log) > 1048576) {
-                    fclose(g_log);
-                    g_log = _wfopen(path, L"w");
-                }
-            }
+    log_open();
+    if (g_log) {
+        fseek(g_log, 0, SEEK_END);
+        if (ftell(g_log) > 1048576) {
+            fclose(g_log);
+            g_log = _wfopen(g_log_path, L"w");
+            if (g_log) fputs("log truncated at 1 MB\n", g_log);
         }
     }
     if (g_log) {
@@ -367,13 +402,15 @@ static void walk(void *obj, int depth, const char *parent, int tree) {
     view.hasRadius = has_radius;
     view.width = width;
     view.height = height;
-    if (g_settings.dry && fe && (name[0] || has_radius) && g_named_logs < 100) {
-        char cn[160];
-        runtime_class(fe, cn, sizeof cn);
+    if (fe && (name[0] || has_radius) && g_ndump < MAX_DUMP) {
+        DumpEl *el = &g_dump[g_ndump++];
+        memset(el, 0, sizeof *el);
+        _snprintf(el->name, sizeof el->name, "%s", name);
+        runtime_class(fe, el->cls, sizeof el->cls);
         const char *tgt = name_target(name);
-        log_msg("element name=%s class=%s w=%.0f h=%.0f%s%s", name[0] ? name : "(unnamed)", cn[0] ? cn : "?", width, height,
-                tgt ? " target=" : "", tgt ? tgt : "");
-        if (++g_named_logs == 100) log_line("element dump truncated at 100");
+        if (tgt) _snprintf(el->target, sizeof el->target, "%s", tgt);
+        el->w = width;
+        el->h = height;
     }
     if (fe && tweak_interesting(&view)) {
         if (!border) border = qi(obj, &IID_BORDER);
@@ -418,7 +455,7 @@ static void *owner_of_peer(void *peer) {
     void *owner = NULL;
     typedef long (*Fn)(void *, void **);
     long hr = ((Fn)slot(peer, VT_GET_OWNER))(peer, &owner);
-    if (g_settings.dry || !g_have_root || hr < 0) log_msg("get_Owner hr=%08lx", (unsigned long)hr);
+    if (g_detail) log_msg("get_Owner hr=%08lx", (unsigned long)hr);
     if (hr < 0) return NULL;
     return owner;
 }
@@ -427,12 +464,12 @@ static void *element_from_provider(void *provider, const char *via) {
     if (!provider) return NULL;
     char cn[160];
     runtime_class(provider, cn, sizeof cn);
-    if (g_settings.dry || !g_have_root) log_msg("%s provider class=%s", via, cn[0] ? cn : "(not WinRT)");
+    if (g_detail) log_msg("%s provider class=%s", via, cn[0] ? cn : "(not WinRT)");
     void *direct = qi(provider, &IID_FE);
     if (direct) {
         char name[96];
         read_name(direct, name, sizeof name);
-        if (g_settings.dry || !g_have_root)
+        if (g_detail)
             log_msg("%s provider is FrameworkElement name=%s", via, name[0] ? name : "(unnamed)");
         return direct;
     }
@@ -444,7 +481,7 @@ static void *element_from_provider(void *provider, const char *via) {
             rel(as_peer);
         }
     }
-    if (!peer && ensure_api()) {
+    if (!peer && !g_peer_unsupported && ensure_api()) {
         if (!g_peer_factory) {
             HSTRING hs = NULL;
             const wchar_t *cls_name = L"Microsoft.UI.Xaml.Automation.Peers.AutomationPeer";
@@ -453,14 +490,16 @@ static void *element_from_provider(void *provider, const char *via) {
                 hr = g_activate(hs, &IID_PEER_PROTECTED, &g_peer_factory);
                 g_delete(hs);
             }
-            if (!g_peer_factory && (g_settings.dry || !g_have_root))
-                log_msg("AutomationPeer factory hr=%08lx", (unsigned long)hr);
+            if (!g_peer_factory) {
+                g_peer_unsupported = 1;
+                if (g_detail) log_msg("AutomationPeer factory hr=%08lx", (unsigned long)hr);
+            }
         }
         if (g_peer_factory) {
             void *made = NULL;
             typedef long (*Fn)(void *, void *, void **);
             long hr = ((Fn)slot(g_peer_factory, VT_PEER_FROM_PROVIDER))(g_peer_factory, provider, &made);
-            if (g_settings.dry || !g_have_root || hr < 0) log_msg("%s PeerFromProvider hr=%08lx", via, (unsigned long)hr);
+            if (g_detail) log_msg("%s PeerFromProvider hr=%08lx", via, (unsigned long)hr);
             if (hr >= 0 && made) {
                 peer = qi(made, &IID_PEER_OWNER);
                 rel(made);
@@ -468,12 +507,202 @@ static void *element_from_provider(void *provider, const char *via) {
         }
     }
     if (!peer) {
-        if (g_settings.dry || !g_have_root) log_msg("%s no FrameworkElementAutomationPeer", via);
+        if (g_detail) log_msg("%s no FrameworkElementAutomationPeer", via);
         return NULL;
     }
     void *owner = owner_of_peer(peer);
     rel(peer);
     return owner;
+}
+
+static int readable(const void *p, size_t bytes) {
+    MEMORY_BASIC_INFORMATION info;
+    if (!p || !VirtualQuery(p, &info, sizeof info) || info.State != MEM_COMMIT) return 0;
+    if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
+    DWORD prot = info.Protect & 0xff;
+    if (prot != PAGE_READONLY && prot != PAGE_READWRITE && prot != PAGE_WRITECOPY && prot != PAGE_EXECUTE_READ &&
+        prot != PAGE_EXECUTE_READWRITE && prot != PAGE_EXECUTE_WRITECOPY)
+        return 0;
+    return (uintptr_t)p + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
+}
+
+static int executable(const void *p) {
+    MEMORY_BASIC_INFORMATION info;
+    if (!p || !VirtualQuery(p, &info, sizeof info) || info.State != MEM_COMMIT) return 0;
+    DWORD prot = info.Protect & 0xff;
+    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+}
+
+static int looks_like_com(void *obj) {
+    if (!readable(obj, sizeof(void *))) return 0;
+    void **vt = *(void ***)obj;
+    if (!readable(vt, sizeof(void *) * 4)) return 0;
+    return executable(vt[0]) && executable(vt[1]) && executable(vt[2]);
+}
+
+static void *content_of(void *face, int slot_index, long *hr_out) {
+    void *content = NULL;
+    typedef long (*Fn)(void *, void **);
+    long hr = ((Fn)slot(face, slot_index))(face, &content);
+    if (hr_out) *hr_out = hr;
+    if (hr < 0) return NULL;
+    return content;
+}
+
+/* Return a UIElement from a WinUI window, island, XamlRoot, or the element itself. */
+static void *as_element(void *obj, const char *how) {
+    if (!obj) return NULL;
+    char cn[160];
+    runtime_class(obj, cn, sizeof cn);
+    if (g_detail) log_msg("%s class=%s", how, cn[0] ? cn : "(not WinRT)");
+    void *fe = qi(obj, &IID_FE);
+    if (fe) return fe;
+    const struct {
+        const GUID *iid;
+        int slot_index;
+        const char *label;
+    } faces[] = {
+        {&IID_WINDOW, VT_WINDOW_GET_CONTENT, "Window.Content"},
+        {&IID_XAML_ISLAND, VT_HOST_GET_CONTENT, "XamlIsland.Content"},
+        {&IID_DWXS, VT_HOST_GET_CONTENT, "DesktopWindowXamlSource.Content"},
+        {&IID_XAML_ROOT, VT_HOST_GET_CONTENT, "XamlRoot.Content"},
+    };
+    for (int i = 0; i < 4; i++) {
+        void *face = qi(obj, faces[i].iid);
+        if (!face) continue;
+        long hr = 0;
+        void *content = content_of(face, faces[i].slot_index, &hr);
+        rel(face);
+        if (g_detail) log_msg("%s %s hr=%08lx content=%s", how, faces[i].label, (unsigned long)hr, content ? "yes" : "null");
+        if (content) return content;
+    }
+    return NULL;
+}
+
+static void *window_current(void) {
+    static void *factory;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        HSTRING hs = NULL;
+        const wchar_t *cls = L"Microsoft.UI.Xaml.Window";
+        long hr = ensure_api() ? g_create(cls, (unsigned)wcslen(cls), &hs) : (long)0x80004005;
+        if (hr >= 0) {
+            hr = g_activate(hs, &IID_WINDOW_STATICS, &factory);
+            g_delete(hs);
+        }
+        if (g_detail) log_msg("Window statics hr=%08lx", (unsigned long)hr);
+    }
+    if (!factory) return NULL;
+    void *window = NULL;
+    typedef long (*Fn)(void *, void **);
+    long hr = ((Fn)slot(factory, VT_HOST_GET_CONTENT))(factory, &window);
+    if (g_detail) log_msg("Window.Current hr=%08lx %s", (unsigned long)hr, window ? "yes" : "null");
+    if (hr < 0 || !window) return NULL;
+    void *content = as_element(window, "Window.Current");
+    rel(window);
+    return content;
+}
+
+static void *from_userdata(HWND hwnd, const char *label) {
+    LONG_PTR raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!raw) {
+        if (g_detail) log_msg("userdata %s null", label);
+        return NULL;
+    }
+    void *obj = (void *)(uintptr_t)raw;
+    if (!looks_like_com(obj)) {
+        if (g_detail) log_msg("userdata %s %p is not a com object", label, obj);
+        return NULL;
+    }
+    void *native = qi(obj, &IID_WINDOW_NATIVE);
+    if (native) {
+        HWND got = NULL;
+        typedef long (*Fn)(void *, HWND *);
+        long hr = ((Fn)slot(native, 3))(native, &got);
+        rel(native);
+        if (g_detail) log_msg("userdata %s IWindowNative hr=%08lx hwnd=%p", label, (unsigned long)hr, (void *)got);
+        if (hr >= 0 && got && got != hwnd) return NULL;
+    } else if (g_detail) {
+        log_msg("userdata %s has no IWindowNative", label);
+    }
+    return as_element(obj, label);
+}
+
+static void uia_text(void *simple, int property, char *out, int cap) {
+    VARIANT value;
+    typedef long (*Fn)(void *, int, VARIANT *);
+    out[0] = 0;
+    VariantInit(&value);
+    if (((Fn)slot(simple, 4))(simple, property, &value) >= 0 && value.vt == VT_BSTR && value.bstrVal)
+        WideCharToMultiByte(CP_UTF8, 0, value.bstrVal, -1, out, cap, NULL, NULL);
+    VariantClear(&value);
+}
+
+static void uia_walk(void *node, int depth, int *budget) {
+    void *frag;
+    void *child;
+    typedef long (*Fn)(void *, int, void **);
+    if (!node || depth > 4 || *budget <= 0) return;
+    frag = qi(node, &IID_FRAG);
+    if (!frag) return;
+    child = NULL;
+    if (((Fn)slot(frag, 3))(frag, 3, &child) < 0) child = NULL;
+    while (child && *budget > 0) {
+        void *simple = qi(child, &IID_RAW);
+        void *next = NULL;
+        void *child_frag;
+        (*budget)--;
+        if (simple) {
+            char name[96], cls[96];
+            uia_text(simple, 30005, name, sizeof name);
+            uia_text(simple, 30012, cls, sizeof cls);
+            rel(simple);
+            if (name[0] || cls[0])
+                log_msg("uia-node depth=%d name=%s class=%s", depth, name[0] ? name : "(none)", cls[0] ? cls : "?");
+        }
+        child_frag = qi(child, &IID_FRAG);
+        if (child_frag) {
+            uia_walk(child, depth + 1, budget);
+            if (((Fn)slot(child_frag, 3))(child_frag, 1, &next) < 0) next = NULL;
+            rel(child_frag);
+        }
+        rel(child);
+        child = next;
+    }
+    rel(frag);
+}
+
+static void *g_root_ids[8];
+static int g_nroot_ids;
+static int g_trees;
+
+static int consider(void *el) {
+    void *id;
+    if (!el) return 0;
+    id = qi(el, &IID_UNK);
+    if (!id) {
+        rel(el);
+        return 0;
+    }
+    for (int i = 0; i < g_nroot_ids; i++) {
+        if (g_root_ids[i] == id) {
+            rel(id);
+            rel(el);
+            return 0;
+        }
+    }
+    if (g_nroot_ids < 8) g_root_ids[g_nroot_ids++] = id;
+    else rel(id);
+    if (g_detail) {
+        char cn[160], name[96];
+        runtime_class(el, cn, sizeof cn);
+        read_name(el, name, sizeof name);
+        log_msg("xaml root class=%s name=%s", cn[0] ? cn : "?", name[0] ? name : "(unnamed)");
+    }
+    walk(el, 0, "", g_trees++);
+    rel(el);
+    return 1;
 }
 
 static int islands_on_thread(void) {
@@ -485,7 +714,7 @@ static int islands_on_thread(void) {
             hr = g_activate(hs, &IID_ISLAND_STATICS, &g_island_factory);
             g_delete(hs);
         }
-        if (g_settings.dry || !g_have_root)
+        if (g_detail)
             log_msg("island factory hr=%08lx thread=%lu", (unsigned long)hr, GetCurrentThreadId());
         if (hr < 0 || !g_island_factory) return 0;
     }
@@ -493,7 +722,7 @@ static int islands_on_thread(void) {
     void **items = NULL;
     typedef long (*Fn)(void *, unsigned int *, void ***);
     long hr = ((Fn)slot(g_island_factory, VT_ISLAND_FIND_ALL))(g_island_factory, &count, &items);
-    if (g_settings.dry || !g_have_root || hr < 0)
+    if (g_detail)
         log_msg("island FindAllForCurrentThread hr=%08lx count=%u thread=%lu", (unsigned long)hr, count,
                 GetCurrentThreadId());
     if (hr < 0 || !items || count == 0 || count > 64) {
@@ -504,7 +733,6 @@ static int islands_on_thread(void) {
         if (items) CoTaskMemFree(items);
         return 0;
     }
-    int trees = 0;
     for (unsigned int i = 0; i < count; i++) {
         void *island = items[i];
         if (!island) continue;
@@ -514,28 +742,53 @@ static int islands_on_thread(void) {
         void *provider = NULL;
         typedef long (*FnProv)(void *, void **);
         long prov_hr = ((FnProv)slot(island, VT_ISLAND_GET_PROVIDER))(island, &provider);
-        if (g_settings.dry || !g_have_root)
+        if (g_detail)
             log_msg("island %u id_hr=%08lx id=%llx provider_hr=%08lx", i, (unsigned long)id_hr, id, (unsigned long)prov_hr);
+        {
+            void *app = NULL;
+            typedef long (*FnGet)(void *, void **);
+            long app_hr = ((FnGet)slot(island, VT_ISLAND_GET_APPDATA))(island, &app);
+            if (g_detail) log_msg("island %u AppData hr=%08lx", i, (unsigned long)app_hr);
+            if (app_hr >= 0 && app) {
+                void *root = as_element(app, "island.AppData");
+                rel(app);
+                consider(root);
+            }
+            void *props = NULL;
+            long props_hr = ((FnGet)slot(island, VT_ISLAND_GET_PROPS))(island, &props);
+            if (g_detail) {
+                char cn[160];
+                runtime_class(props, cn, sizeof cn);
+                log_msg("island %u CustomProperties hr=%08lx class=%s", i, (unsigned long)props_hr, props ? (cn[0] ? cn : "(not WinRT)") : "null");
+            }
+            if (props) {
+                consider(as_element(props, "island.CustomProperties"));
+                rel(props);
+            }
+        }
         if (prov_hr >= 0 && provider) {
             char tag[32];
             _snprintf(tag, sizeof tag, "island %u", i);
             void *root = element_from_provider(provider, tag);
-            rel(provider);
-            if (root) {
-                char cn[160], name[96];
-                runtime_class(root, cn, sizeof cn);
-                read_name(root, name, sizeof name);
-                    if (g_settings.dry || !g_have_root)
-                        log_msg("island %u root class=%s name=%s", i, cn[0] ? cn : "?", name[0] ? name : "(unnamed)");
-                g_named_logs = 0;
-                walk(root, 0, "", trees++);
-                rel(root);
+            if (root) consider(root);
+            else if (g_detail) {
+                void *simple = qi(provider, &IID_RAW);
+                if (simple) {
+                    char name[96], cls[96];
+                    uia_text(simple, 30005, name, sizeof name);
+                    uia_text(simple, 30012, cls, sizeof cls);
+                    rel(simple);
+                    log_msg("island %u uia name=%s class=%s", i, name[0] ? name : "(none)", cls[0] ? cls : "?");
+                }
+                int budget = 40;
+                uia_walk(provider, 1, &budget);
             }
+            rel(provider);
         }
         rel(island);
     }
     CoTaskMemFree(items);
-    return trees;
+    return g_trees;
 }
 
 static void *root_from_hwnd(HWND hwnd) {
@@ -583,6 +836,8 @@ static BOOL CALLBACK collect_child(HWND hwnd, LPARAM param) {
     return TRUE;
 }
 
+static void flush_dump(void);
+
 static void rebuild(void) {
     for (int i = 0; i < g_nseen; i++) rel(g_seen[i]);
     g_nseen = 0;
@@ -591,33 +846,49 @@ static void rebuild(void) {
     if (!ensure_sta()) return;
 
     g_named_logs = 0;
-    int trees = islands_on_thread();
-    if (!trees) {
-        WinList tops = {GetCurrentProcessId(), {0}, 0};
-        EnumWindows(collect_top, (LPARAM)&tops);
+    g_ndump = 0;
+    g_dumped = 0;
+    g_trees = 0;
+    for (int i = 0; i < g_nroot_ids; i++) rel(g_root_ids[i]);
+    g_nroot_ids = 0;
+
+    consider(window_current());
+    WinList tops = {GetCurrentProcessId(), {0}, 0};
+    EnumWindows(collect_top, (LPARAM)&tops);
+    for (int i = 0; i < tops.count; i++) {
+        char utf[128];
+        wchar_t cls[128];
+        if (!GetClassNameW(tops.hwnds[i], cls, 128)) continue;
+        if (wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0 && !wcsstr(cls, L"SiteBridge")) continue;
+        WideCharToMultiByte(CP_UTF8, 0, cls, -1, utf, sizeof utf, NULL, NULL);
+        consider(from_userdata(tops.hwnds[i], utf));
+    }
+    WinList children = {0, {0}, 0};
+    for (int i = 0; i < tops.count && children.count < 24; i++)
+        EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
+    for (int i = 0; i < children.count; i++) {
+        char utf[128];
+        wchar_t cls[128];
+        if (!GetClassNameW(children.hwnds[i], cls, 128)) continue;
+        WideCharToMultiByte(CP_UTF8, 0, cls, -1, utf, sizeof utf, NULL, NULL);
+        consider(from_userdata(children.hwnds[i], utf));
+    }
+    islands_on_thread();
+    int trees = g_trees;
+    if (!trees && g_detail) {
         for (int i = 0; i < tops.count; i++) {
             void *root = root_from_hwnd(tops.hwnds[i]);
-            if (!root) continue;
-            walk(root, 0, "", trees++);
-            rel(root);
+            consider(root);
         }
-        if (!trees) {
-            WinList children = {0, {0}, 0};
-            for (int i = 0; i < tops.count && children.count < 24; i++)
-                EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
-            for (int i = 0; i < children.count; i++) {
-                void *root = root_from_hwnd(children.hwnds[i]);
-                if (!root) continue;
-                walk(root, 0, "", trees++);
-                rel(root);
-            }
-        }
+        for (int i = 0; i < children.count; i++) consider(root_from_hwnd(children.hwnds[i]));
+        trees = g_trees;
     }
+    flush_dump();
     if (!trees && !g_logged_root) {
         g_logged_root = 1;
         log_line("no WinUI root yet; toggles stay off until one appears");
     } else if (trees) {
-        if (g_settings.dry || !g_have_root) log_msg("found %d WinUI root(s)", trees);
+        if (g_detail) log_msg("found %d WinUI root(s)", trees);
         g_logged_root = 0;
         g_have_root = 1;
     }
@@ -654,6 +925,27 @@ static void rebuild(void) {
     g_nnext = 0;
     for (int i = 0; i < g_nseen; i++) rel(g_seen[i]);
     g_nseen = 0;
+    for (int i = 0; i < g_nroot_ids; i++) rel(g_root_ids[i]);
+    g_nroot_ids = 0;
+}
+
+static void flush_dump(void) {
+    char sig[8192];
+    size_t n = 0;
+    sig[0] = 0;
+    for (int i = 0; i < g_ndump; i++) {
+        int wrote = _snprintf(sig + n, sizeof sig - n, "%s|%s;", g_dump[i].name, g_dump[i].target);
+        if (wrote < 0 || n + (size_t)wrote >= sizeof sig) break;
+        n += (size_t)wrote;
+    }
+    if (!g_settings.dry || strcmp(sig, g_dump_sig) == 0) return;
+    memcpy(g_dump_sig, sig, n + 1);
+    g_dumped = 1;
+    for (int i = 0; i < g_ndump; i++)
+        log_msg("element name=%s class=%s w=%.0f h=%.0f%s%s", g_dump[i].name[0] ? g_dump[i].name : "(unnamed)",
+                g_dump[i].cls[0] ? g_dump[i].cls : "?", g_dump[i].w, g_dump[i].h,
+                g_dump[i].target[0] ? " target=" : "", g_dump[i].target);
+    if (g_ndump == MAX_DUMP) log_line("element dump truncated at 100");
 }
 
 typedef struct Live {
@@ -901,12 +1193,61 @@ static void load_settings(void) {
          g_settings.dry, g_settings.inset);
 }
 
+static int toplevels_changed(void) {
+    WinList tops = {GetCurrentProcessId(), {0}, 0};
+    int changed = 0;
+    EnumWindows(collect_top, (LPARAM)&tops);
+    if (tops.count != g_known_top_n) changed = 1;
+    for (int i = 0; !changed && i < tops.count; i++) {
+        int found = 0;
+        for (int j = 0; j < g_known_top_n; j++)
+            if (g_known_tops[j] == tops.hwnds[i]) found = 1;
+        if (!found) changed = 1;
+    }
+    g_known_top_n = tops.count;
+    for (int i = 0; i < tops.count && i < 16; i++) g_known_tops[i] = tops.hwnds[i];
+    return changed;
+}
+
 static void apply(void) {
+    DWORD now;
     if (!g_host_ok || !ensure_sta()) return;
     load_settings();
-    int rebuilt = (g_tick % 5) == 0 || g_ncache == 0;
-    g_tick++;
-    if (rebuilt) rebuild();
+    now = GetTickCount();
+    if (g_have_root) {
+        if ((g_tick++ % 5) == 0) {
+            g_detail = 0;
+            rebuild();
+        }
+    } else if (g_discover_paused) {
+        if (toplevels_changed()) {
+            log_line("new top-level window; retrying discovery");
+            g_discover_paused = 0;
+            g_discover_attempts = 0;
+            g_discover_gap = 1000;
+            g_discover_start = now;
+            g_detail = 1;
+            rebuild();
+        }
+    } else if (g_discover_attempts == 0 || now - g_last_discover >= g_discover_gap) {
+        g_detail = g_discover_attempts == 0;
+        g_discover_attempts++;
+        g_last_discover = now;
+        if (!g_discover_start) g_discover_start = now;
+        rebuild();
+        if (!g_have_root) {
+            if (g_discover_gap < 1000) g_discover_gap = 1000;
+            else if (g_discover_gap < 30000) g_discover_gap *= 2;
+            if (g_discover_gap > 30000) g_discover_gap = 30000;
+            if (g_discover_attempts == 8 || now - g_discover_start > 180000) {
+                toplevels_changed();
+                g_discover_paused = 1;
+                log_msg("discovery paused after %d attempts; waiting for a new top-level window", g_discover_attempts);
+            } else if (!g_detail) {
+                log_msg("discovery attempt %d failed; next in %lu ms", g_discover_attempts, g_discover_gap);
+            }
+        }
+    }
 
     Live lives[MAX_CACHE];
     int assistant = 0;
@@ -948,7 +1289,7 @@ static void apply(void) {
         tweak_plan(&g_settings, &element, &plans[i]);
     }
     tweak_prefer_outer_inset(plans, depth, tree, g_ncache);
-    if (g_settings.dry && rebuilt) {
+    if (g_dumped) {
         for (int i = 0; i < g_ncache; i++) {
             if (!lives[i].ok || !tweak_plan_changes(&plans[i])) continue;
             log_msg("plan %s visibility=%d margin=%d padding=%d radius=%d",
