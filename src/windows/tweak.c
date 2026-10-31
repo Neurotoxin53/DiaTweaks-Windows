@@ -219,3 +219,25 @@ void tweak_prefer_outer_inset(TweakPlan *plans, const int *depth, const int *tre
 int tweak_plan_changes(const TweakPlan *plan) {
     return plan->visibility >= 0 || plan->setMargin || plan->setPadding || plan->setRadius;
 }
+
+int tweak_log_crashed(const char *tail) {
+    const char *last, *scan, *msg;
+    size_t len;
+    if (!tail || !tail[0]) return 0;
+    last = tail;
+    for (scan = tail; *scan; scan++)
+        if (*scan == '\n' && scan[1]) last = scan + 1;
+    len = strlen(last);
+    while (len && (last[len - 1] == '\n' || last[len - 1] == '\r' || last[len - 1] == ' ' || last[len - 1] == '\t'))
+        len--;
+    if (len == 0) return 0;
+    msg = last;
+    if (len >= 20 && last[4] == '-' && last[7] == '-' && last[10] == ' ' && last[13] == ':' && last[16] == ':' &&
+        last[19] == ' ') {
+        msg = last + 20;
+        len -= 20;
+    }
+    if (len == 18 && strncmp(msg, "discovery finished", 18) == 0) return 0;
+    if (len == 8 && strncmp(msg, "shutdown", 8) == 0) return 0;
+    return 1;
+}

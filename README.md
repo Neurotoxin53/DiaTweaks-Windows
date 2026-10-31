@@ -107,7 +107,7 @@ That deletes `%LOCALAPPDATA%\DiaPatches` and the shortcut. The Dia package is le
 
 ### How it works
 
-On Dia's UI thread the add-on reads `Microsoft.UI.Xaml.Window.Current` and the WinUI window's own object, then the content island's `AppData`, and walks that XAML root. The island's automation provider is only a fallback. Names below are `x:Name`s in the 1.4.0.424 package. With `dry` on, a changed tree is dumped once. A failed lookup is logged once, then retried at 1s, 2s, 4s, up to 30s, and stops after about three minutes until a new top-level window appears. The log is cut back to empty at 1 MB.
+On Dia's UI thread the add-on calls `Window.Current` and `ContentIsland.FindAllForCurrentThread`, then reads each island's `AppData` and `CustomProperties` through WinRT. It does not call through window userdata. There is no public list of `Window` or `XamlIsland` objects when `Window.Current` is null, so those two properties are the only supported way from the island back to a XAML element. With `dry` on, a changed tree is dumped once. A failed lookup is logged once, then retried at 1s, 2s, 4s, up to 30s, and stops after about three minutes until a new top-level window appears. Each lookup logs `step …` before the call and `discovery finished` when it returns. If the log does not end on `discovery finished` or `shutdown`, the next launch skips discovery and logs `previous run crashed; disabled` until `tweaks.json` is saved again. A disabled run does not write `shutdown`, so quitting Dia does not clear that skip. The log is cut back to empty at 1 MB.
 
 | Tweak | What it changes |
 | --- | --- |

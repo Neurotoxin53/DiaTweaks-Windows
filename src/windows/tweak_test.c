@@ -216,6 +216,19 @@ static void test_outer(void) {
     CHECK(plans[2].setMargin == 1);
 }
 
+static void test_log_tail(void) {
+    CHECK(tweak_log_crashed(NULL) == 0);
+    CHECK(tweak_log_crashed("") == 0);
+    CHECK(tweak_log_crashed("\n") == 0);
+    CHECK(tweak_log_crashed("2026-10-31 22:04:17 discovery finished\n") == 0);
+    CHECK(tweak_log_crashed("2026-10-31 22:04:17 shutdown\r\n") == 0);
+    CHECK(tweak_log_crashed("22:04:17 loaded\n22:04:17 Window.Current hr=00000000 null\n") == 1);
+    CHECK(tweak_log_crashed("2026-10-31 22:04:17 discovery finished\n2026-10-31 22:04:18 step island-appdata") == 1);
+    CHECK(tweak_log_crashed("2026-10-31 22:04:17 previous run crashed; disabled\n") == 1);
+    CHECK(tweak_log_crashed("2026-10-31 22:04:17 discovery fault during island-appdata; add-on disabled\n") == 1);
+    CHECK(tweak_log_crashed("2026-10-31 22:03:54 settings edge=1\n2026-10-31 22:04:17 shutdown\n") == 0);
+}
+
 static void test_interesting(void) {
     TweakElement root = blank("", "");
     CHECK(tweak_interesting(&root) == 1);
@@ -233,6 +246,7 @@ int main(void) {
     test_inset();
     test_square();
     test_outer();
+    test_log_tail();
     test_interesting();
     if (g_failed) {
         fprintf(stderr, "%d failed\n", g_failed);

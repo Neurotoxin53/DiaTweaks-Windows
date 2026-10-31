@@ -50,5 +50,8 @@ void tweak_plan(const TweakSettings *settings, const TweakElement *element, Twea
    child are not both pulled outward. tree[] and depth[] are parallel to plans. */
 void tweak_prefer_outer_inset(TweakPlan *plans, const int *depth, const int *tree, int count);
 int tweak_plan_changes(const TweakPlan *plan);
+/* 1 when a log tail does not end on "discovery finished" or "shutdown".
+   An empty tail is not a crash. A leading YYYY-MM-DD HH:MM:SS stamp is ignored. */
+int tweak_log_crashed(const char *tail);
 
 #endif

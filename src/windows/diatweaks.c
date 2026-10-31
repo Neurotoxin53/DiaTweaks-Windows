@@ -10,8 +10,10 @@
 #include "tweak.h"
 #include "winrt_ids.h"
 
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef void *HSTRING;
@@ -38,7 +40,6 @@ static const GUID IID_INSPECT = {0xAF86E2E0, 0xB12D, 0x4C6A, {0x9C, 0x5A, 0xD7, 
 static const GUID IID_ISLAND_STATICS = {0x7B9EB7CC, 0x8C43, 0x5E0A, {0xAB, 0x23, 0xAB, 0x48, 0x62, 0x8F, 0xD2, 0x23}};
 static const GUID IID_WINDOW = {0x61F0EC79, 0x5D52, 0x56B5, {0x86, 0xFB, 0x40, 0xFA, 0x4A, 0xF2, 0x88, 0xB0}};
 static const GUID IID_WINDOW_STATICS = {0x8CC985E3, 0xA41A, 0x5DF4, {0xB5, 0x31, 0xD3, 0xA1, 0x78, 0x8D, 0x86, 0xC5}};
-static const GUID IID_WINDOW_NATIVE = {0xEECDBF0E, 0xBAE9, 0x4CB6, {0xA6, 0x8E, 0x95, 0x98, 0xE1, 0xCB, 0x57, 0xBB}};
 static const GUID IID_XAML_ROOT = {0x60CB215A, 0xAD15, 0x520A, {0x8B, 0x01, 0x44, 0x16, 0x82, 0x4F, 0x04, 0x41}};
 static const GUID IID_XAML_ISLAND = {0x845A5C62, 0xB0F3, 0x5DB8, {0xB4, 0xFF, 0x41, 0x42, 0xBB, 0xD8, 0xA0, 0x44}};
 static const GUID IID_DWXS = {0x553AF92C, 0x1381, 0x51D6, {0xBE, 0xE0, 0xF3, 0x4B, 0xEB, 0x04, 0x2E, 0xA8}};
@@ -106,6 +107,14 @@ static int g_logged_root;
 static int g_have_root;
 static int g_detail;
 static int g_dumped;
+static volatile int g_disabled;
+static volatile LONG g_log_held;
+static volatile DWORD g_fault_code;
+static FILETIME g_json_seen;
+static int g_json_seen_ok;
+static const char *volatile g_step = "none";
+static jmp_buf g_abort;
+static volatile LONG g_guard;
 static int g_peer_unsupported;
 static int g_ndump;
 static int g_discover_attempts;
@@ -157,6 +166,7 @@ static void log_open(void) {
 
 static void log_line(const char *text) {
     EnterCriticalSection(&g_log_lock);
+    g_log_held = 1;
     log_open();
     if (g_log) {
         fseek(g_log, 0, SEEK_END);
@@ -173,6 +183,7 @@ static void log_line(const char *text) {
                 st.wSecond, text);
         fflush(g_log);
     }
+    g_log_held = 0;
     LeaveCriticalSection(&g_log_lock);
 }
 
@@ -515,29 +526,9 @@ static void *element_from_provider(void *provider, const char *via) {
     return owner;
 }
 
-static int readable(const void *p, size_t bytes) {
-    MEMORY_BASIC_INFORMATION info;
-    if (!p || !VirtualQuery(p, &info, sizeof info) || info.State != MEM_COMMIT) return 0;
-    if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
-    DWORD prot = info.Protect & 0xff;
-    if (prot != PAGE_READONLY && prot != PAGE_READWRITE && prot != PAGE_WRITECOPY && prot != PAGE_EXECUTE_READ &&
-        prot != PAGE_EXECUTE_READWRITE && prot != PAGE_EXECUTE_WRITECOPY)
-        return 0;
-    return (uintptr_t)p + bytes <= (uintptr_t)info.BaseAddress + info.RegionSize;
-}
-
-static int executable(const void *p) {
-    MEMORY_BASIC_INFORMATION info;
-    if (!p || !VirtualQuery(p, &info, sizeof info) || info.State != MEM_COMMIT) return 0;
-    DWORD prot = info.Protect & 0xff;
-    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
-}
-
-static int looks_like_com(void *obj) {
-    if (!readable(obj, sizeof(void *))) return 0;
-    void **vt = *(void ***)obj;
-    if (!readable(vt, sizeof(void *) * 4)) return 0;
-    return executable(vt[0]) && executable(vt[1]) && executable(vt[2]);
+static void step(const char *name) {
+    g_step = name;
+    log_msg("step %s", name);
 }
 
 static void *content_of(void *face, int slot_index, long *hr_out) {
@@ -586,6 +577,7 @@ static void *window_current(void) {
         tried = 1;
         HSTRING hs = NULL;
         const wchar_t *cls = L"Microsoft.UI.Xaml.Window";
+        step("window-statics");
         long hr = ensure_api() ? g_create(cls, (unsigned)wcslen(cls), &hs) : (long)0x80004005;
         if (hr >= 0) {
             hr = g_activate(hs, &IID_WINDOW_STATICS, &factory);
@@ -596,37 +588,13 @@ static void *window_current(void) {
     if (!factory) return NULL;
     void *window = NULL;
     typedef long (*Fn)(void *, void **);
+    step("window-get-current");
     long hr = ((Fn)slot(factory, VT_HOST_GET_CONTENT))(factory, &window);
     if (g_detail) log_msg("Window.Current hr=%08lx %s", (unsigned long)hr, window ? "yes" : "null");
     if (hr < 0 || !window) return NULL;
     void *content = as_element(window, "Window.Current");
     rel(window);
     return content;
-}
-
-static void *from_userdata(HWND hwnd, const char *label) {
-    LONG_PTR raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (!raw) {
-        if (g_detail) log_msg("userdata %s null", label);
-        return NULL;
-    }
-    void *obj = (void *)(uintptr_t)raw;
-    if (!looks_like_com(obj)) {
-        if (g_detail) log_msg("userdata %s %p is not a com object", label, obj);
-        return NULL;
-    }
-    void *native = qi(obj, &IID_WINDOW_NATIVE);
-    if (native) {
-        HWND got = NULL;
-        typedef long (*Fn)(void *, HWND *);
-        long hr = ((Fn)slot(native, 3))(native, &got);
-        rel(native);
-        if (g_detail) log_msg("userdata %s IWindowNative hr=%08lx hwnd=%p", label, (unsigned long)hr, (void *)got);
-        if (hr >= 0 && got && got != hwnd) return NULL;
-    } else if (g_detail) {
-        log_msg("userdata %s has no IWindowNative", label);
-    }
-    return as_element(obj, label);
 }
 
 static void uia_text(void *simple, int property, char *out, int cap) {
@@ -709,6 +677,7 @@ static int islands_on_thread(void) {
     if (!g_island_factory) {
         HSTRING hs = NULL;
         const wchar_t *cls = L"Microsoft.UI.Content.ContentIsland";
+        step("island-factory");
         long hr = ensure_api() ? g_create(cls, (unsigned)wcslen(cls), &hs) : (long)0x80004005;
         if (hr >= 0) {
             hr = g_activate(hs, &IID_ISLAND_STATICS, &g_island_factory);
@@ -721,6 +690,7 @@ static int islands_on_thread(void) {
     unsigned int count = 0;
     void **items = NULL;
     typedef long (*Fn)(void *, unsigned int *, void ***);
+    step("island-findall");
     long hr = ((Fn)slot(g_island_factory, VT_ISLAND_FIND_ALL))(g_island_factory, &count, &items);
     if (g_detail)
         log_msg("island FindAllForCurrentThread hr=%08lx count=%u thread=%lu", (unsigned long)hr, count,
@@ -735,37 +705,41 @@ static int islands_on_thread(void) {
     }
     for (unsigned int i = 0; i < count; i++) {
         void *island = items[i];
-        if (!island) continue;
         unsigned long long id = 0;
-        typedef long (*FnId)(void *, unsigned long long *);
-        long id_hr = ((FnId)slot(island, VT_ISLAND_GET_ID))(island, &id);
+        void *app = NULL;
+        void *props = NULL;
         void *provider = NULL;
-        typedef long (*FnProv)(void *, void **);
-        long prov_hr = ((FnProv)slot(island, VT_ISLAND_GET_PROVIDER))(island, &provider);
-        if (g_detail)
-            log_msg("island %u id_hr=%08lx id=%llx provider_hr=%08lx", i, (unsigned long)id_hr, id, (unsigned long)prov_hr);
-        {
-            void *app = NULL;
-            typedef long (*FnGet)(void *, void **);
-            long app_hr = ((FnGet)slot(island, VT_ISLAND_GET_APPDATA))(island, &app);
-            if (g_detail) log_msg("island %u AppData hr=%08lx", i, (unsigned long)app_hr);
-            if (app_hr >= 0 && app) {
-                void *root = as_element(app, "island.AppData");
-                rel(app);
-                consider(root);
-            }
-            void *props = NULL;
-            long props_hr = ((FnGet)slot(island, VT_ISLAND_GET_PROPS))(island, &props);
+        typedef long (*FnGet)(void *, void **);
+        typedef long (*FnId)(void *, unsigned long long *);
+        long id_hr, app_hr, props_hr, prov_hr;
+        if (!island) continue;
+        /* AppData and CustomProperties are the supported reads on this island.
+           GetAutomationHostProvider is logged after them; it did not yield XAML. */
+        step("island-id");
+        id_hr = ((FnId)slot(island, VT_ISLAND_GET_ID))(island, &id);
+        if (g_detail) log_msg("island %u id_hr=%08lx id=%llx", i, (unsigned long)id_hr, id);
+        step("island-appdata");
+        app_hr = ((FnGet)slot(island, VT_ISLAND_GET_APPDATA))(island, &app);
+        if (g_detail) log_msg("island %u AppData hr=%08lx", i, (unsigned long)app_hr);
+        if (app_hr >= 0 && app) {
+            consider(as_element(app, "island.AppData"));
+            rel(app);
+        }
+        step("island-properties");
+        props_hr = ((FnGet)slot(island, VT_ISLAND_GET_PROPS))(island, &props);
+        if (g_detail) log_msg("island %u CustomProperties hr=%08lx", i, (unsigned long)props_hr);
+        if (props_hr >= 0 && props) {
             if (g_detail) {
                 char cn[160];
                 runtime_class(props, cn, sizeof cn);
-                log_msg("island %u CustomProperties hr=%08lx class=%s", i, (unsigned long)props_hr, props ? (cn[0] ? cn : "(not WinRT)") : "null");
+                log_msg("island %u CustomProperties class=%s", i, cn[0] ? cn : "(not WinRT)");
             }
-            if (props) {
-                consider(as_element(props, "island.CustomProperties"));
-                rel(props);
-            }
+            consider(as_element(props, "island.CustomProperties"));
+            rel(props);
         }
+        step("island-provider");
+        prov_hr = ((FnGet)slot(island, VT_ISLAND_GET_PROVIDER))(island, &provider);
+        if (g_detail) log_msg("island %u provider_hr=%08lx", i, (unsigned long)prov_hr);
         if (prov_hr >= 0 && provider) {
             char tag[32];
             _snprintf(tag, sizeof tag, "island %u", i);
@@ -852,34 +826,19 @@ static void rebuild(void) {
     for (int i = 0; i < g_nroot_ids; i++) rel(g_root_ids[i]);
     g_nroot_ids = 0;
 
+    step("window-current");
     consider(window_current());
-    WinList tops = {GetCurrentProcessId(), {0}, 0};
-    EnumWindows(collect_top, (LPARAM)&tops);
-    for (int i = 0; i < tops.count; i++) {
-        char utf[128];
-        wchar_t cls[128];
-        if (!GetClassNameW(tops.hwnds[i], cls, 128)) continue;
-        if (wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0 && !wcsstr(cls, L"SiteBridge")) continue;
-        WideCharToMultiByte(CP_UTF8, 0, cls, -1, utf, sizeof utf, NULL, NULL);
-        consider(from_userdata(tops.hwnds[i], utf));
-    }
-    WinList children = {0, {0}, 0};
-    for (int i = 0; i < tops.count && children.count < 24; i++)
-        EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
-    for (int i = 0; i < children.count; i++) {
-        char utf[128];
-        wchar_t cls[128];
-        if (!GetClassNameW(children.hwnds[i], cls, 128)) continue;
-        WideCharToMultiByte(CP_UTF8, 0, cls, -1, utf, sizeof utf, NULL, NULL);
-        consider(from_userdata(children.hwnds[i], utf));
-    }
+    step("islands");
     islands_on_thread();
     int trees = g_trees;
     if (!trees && g_detail) {
-        for (int i = 0; i < tops.count; i++) {
-            void *root = root_from_hwnd(tops.hwnds[i]);
-            consider(root);
-        }
+        WinList tops = {GetCurrentProcessId(), {0}, 0};
+        WinList children = {0, {0}, 0};
+        step("uia-window");
+        EnumWindows(collect_top, (LPARAM)&tops);
+        for (int i = 0; i < tops.count; i++) consider(root_from_hwnd(tops.hwnds[i]));
+        for (int i = 0; i < tops.count && children.count < 24; i++)
+            EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
         for (int i = 0; i < children.count; i++) consider(root_from_hwnd(children.hwnds[i]));
         trees = g_trees;
     }
@@ -1193,6 +1152,115 @@ static void load_settings(void) {
          g_settings.dry, g_settings.inset);
 }
 
+static int dia_file(const wchar_t *name, wchar_t *out, int cap) {
+    wchar_t root[MAX_PATH];
+    if (!local_appdata(root, MAX_PATH)) return 0;
+    return _snwprintf(out, cap, L"%s\\DiaPatches\\%s", root, name) > 0;
+}
+
+static int file_time(const wchar_t *path, FILETIME *out) {
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info)) return 0;
+    *out = info.ftLastWriteTime;
+    return 1;
+}
+
+static void remember_json(void) {
+    wchar_t path[MAX_PATH];
+    g_json_seen_ok = dia_file(L"tweaks.json", path, MAX_PATH) && file_time(path, &g_json_seen);
+}
+
+static int json_changed(void) {
+    wchar_t path[MAX_PATH];
+    FILETIME now;
+    if (!g_json_seen_ok || !dia_file(L"tweaks.json", path, MAX_PATH) || !file_time(path, &now)) return 0;
+    return CompareFileTime(&now, &g_json_seen) != 0;
+}
+
+static int json_newer_than_log(void) {
+    wchar_t json[MAX_PATH], log_path[MAX_PATH];
+    FILETIME json_time, log_time;
+    if (!dia_file(L"tweaks.json", json, MAX_PATH) || !dia_file(L"diatweaks.log", log_path, MAX_PATH)) return 0;
+    if (!file_time(json, &json_time) || !file_time(log_path, &log_time)) return 0;
+    return CompareFileTime(&json_time, &log_time) > 0;
+}
+
+static int previous_run_crashed(void) {
+    wchar_t path[MAX_PATH];
+    FILE *file;
+    long size, take;
+    char *buf;
+    size_t n;
+    int crashed;
+    if (!dia_file(L"diatweaks.log", path, MAX_PATH)) return 0;
+    file = _wfopen(path, L"rb");
+    if (!file) return 0;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+    size = ftell(file);
+    if (size <= 0) {
+        fclose(file);
+        return 0;
+    }
+    take = size > 8192 ? 8192 : size;
+    if (fseek(file, -take, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+    buf = (char *)malloc((size_t)take + 1);
+    if (!buf) {
+        fclose(file);
+        return 0;
+    }
+    n = fread(buf, 1, (size_t)take, file);
+    fclose(file);
+    buf[n] = 0;
+    crashed = tweak_log_crashed(buf);
+    free(buf);
+    return crashed;
+}
+
+static void fault_trampoline(void) { longjmp(g_abort, 1); }
+
+static LONG CALLBACK discovery_fault(EXCEPTION_POINTERS *info) {
+    DWORD code;
+    if (!g_guard || !info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR && code != EXCEPTION_ILLEGAL_INSTRUCTION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_guard = 0;
+    g_fault_code = code;
+    if (g_log_held) {
+        g_log_held = 0;
+        LeaveCriticalSection(&g_log_lock);
+    }
+    /* Enter fault_trampoline as if CALL pushed a return address: RSP is 8 mod 16. */
+    info->ContextRecord->Rip = (DWORD64)(uintptr_t)fault_trampoline;
+    info->ContextRecord->Rsp &= ~(DWORD64)15;
+    info->ContextRecord->Rsp -= 8;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void discover(void) {
+    PVOID veh = AddVectoredExceptionHandler(1, discovery_fault);
+    g_guard = 1;
+    if (setjmp(g_abort) == 0) {
+        rebuild();
+        g_guard = 0;
+        log_line("discovery finished");
+    } else {
+        g_guard = 0;
+        g_disabled = 1;
+        g_have_root = 0;
+        remember_json();
+        log_msg("discovery fault during %s code=%08lx; add-on disabled", g_step ? g_step : "unknown",
+                (unsigned long)g_fault_code);
+    }
+    if (veh) RemoveVectoredExceptionHandler(veh);
+}
+
 static int toplevels_changed(void) {
     WinList tops = {GetCurrentProcessId(), {0}, 0};
     int changed = 0;
@@ -1213,11 +1281,21 @@ static void apply(void) {
     DWORD now;
     if (!g_host_ok || !ensure_sta()) return;
     load_settings();
+    if (g_disabled) {
+        if (!json_changed()) return;
+        g_disabled = 0;
+        g_discover_paused = 0;
+        g_discover_attempts = 0;
+        g_discover_gap = 0;
+        g_discover_start = 0;
+        remember_json();
+        log_line("settings re-saved; discovery enabled");
+    }
     now = GetTickCount();
     if (g_have_root) {
         if ((g_tick++ % 5) == 0) {
             g_detail = 0;
-            rebuild();
+            discover();
         }
     } else if (g_discover_paused) {
         if (toplevels_changed()) {
@@ -1227,15 +1305,15 @@ static void apply(void) {
             g_discover_gap = 1000;
             g_discover_start = now;
             g_detail = 1;
-            rebuild();
+            discover();
         }
     } else if (g_discover_attempts == 0 || now - g_last_discover >= g_discover_gap) {
         g_detail = g_discover_attempts == 0;
         g_discover_attempts++;
         g_last_discover = now;
         if (!g_discover_start) g_discover_start = now;
-        rebuild();
-        if (!g_have_root) {
+        discover();
+        if (!g_have_root && !g_disabled) {
             if (g_discover_gap < 1000) g_discover_gap = 1000;
             else if (g_discover_gap < 30000) g_discover_gap *= 2;
             if (g_discover_gap > 30000) g_discover_gap = 30000;
@@ -1349,7 +1427,16 @@ static BOOL CALLBACK pick_cb(HWND hwnd, LPARAM param) {
 
 static DWORD WINAPI worker(void *unused) {
     (void)unused;
-    log_line("loaded");
+    if (previous_run_crashed()) {
+        if (json_newer_than_log()) log_line("settings re-saved; discovery enabled");
+        else {
+            g_disabled = 1;
+            remember_json();
+            log_line("previous run crashed; disabled");
+        }
+    } else {
+        log_line("loaded");
+    }
     for (;;) {
         Sleep(500);
         if (g_timer_hwnd && IsWindow(g_timer_hwnd)) continue;
@@ -1396,6 +1483,11 @@ static int host_is_dia(void) {
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
     (void)reserved;
+    if (reason == DLL_PROCESS_DETACH) {
+        /* A disabled run must not end on "shutdown", or the next launch would try discovery again. */
+        if (g_host_ok && !g_disabled) log_line("shutdown");
+        return TRUE;
+    }
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
     g_module = module;
     DisableThreadLibraryCalls(module);
