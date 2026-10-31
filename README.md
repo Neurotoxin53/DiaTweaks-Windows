@@ -107,7 +107,7 @@ That deletes `%LOCALAPPDATA%\DiaPatches` and the shortcut. The Dia package is le
 
 ### How it works
 
-The add-on asks the Dia window for its UI Automation provider and walks the WinUI tree from there. Names below are `x:Name`s in the 1.4.0.424 package.
+On Dia's UI thread the add-on calls `ContentIsland.FindAllForCurrentThread` and follows each island's automation provider into the WinUI tree. UI Automation on the window is only a fallback. Names below are `x:Name`s in the 1.4.0.424 package. With `dry` on, the log records every lookup HRESULT and the element names it found.
 
 | Tweak | What it changes |
 | --- | --- |
@@ -121,7 +121,7 @@ It does not read pages, history, or passwords. It does not use the network. Afte
 
 ### What was not run on Windows
 
-`make -C src/windows test` checks which element gets which change. `make -C src/windows` cross-compiles the exe and DLL. Neither was run against a live Dia window, so the button and toolbar names should match 1.4.0.424, and edge-to-edge and square corners still need a real window. If a name is missing, that tweak does nothing and a line is written to the log.
+`make -C src/windows test` checks which element gets which change. On Dia 1.4.0.424 the first build found `WinUIDesktopWin32WindowClass` and `Microsoft.UI.Content.DesktopChildSiteBridge` but UI Automation did not return a XAML root. This build asks `ContentIsland.FindAllForCurrentThread` on that UI thread. Edge-to-edge and square corners still need the new log from a live window. If a name is missing, that tweak does nothing and a line is written to the log.
 
 ### Risks
 

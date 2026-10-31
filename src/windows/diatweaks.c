@@ -32,6 +32,12 @@ static const GUID IID_PEER_OWNER = DIA_IID_PEER_OWNER;
 static const GUID IID_PEER_PROTECTED = DIA_IID_PEER_PROTECTED;
 static const GUID IID_RAW = DIA_IID_RAW_PROVIDER;
 static const GUID IID_UNK = {0, 0, 0, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+static const GUID IID_INSPECT = {0xAF86E2E0, 0xB12D, 0x4C6A, {0x9C, 0x5A, 0xD7, 0xAA, 0x65, 0x10, 0x1E, 0x90}};
+/* IContentIslandStatics in Dia 1.4.0.424's Microsoft.UI.winmd. FindAllForCurrentThread is slot 8. */
+static const GUID IID_ISLAND_STATICS = {0x7B9EB7CC, 0x8C43, 0x5E0A, {0xAB, 0x23, 0xAB, 0x48, 0x62, 0x8F, 0xD2, 0x23}};
+#define VT_ISLAND_FIND_ALL 8
+#define VT_ISLAND_GET_ID 13
+#define VT_ISLAND_GET_PROVIDER 25
 
 typedef long (*FnRoInit)(int);
 typedef long (*FnActivate)(HSTRING, const GUID *, void **);
@@ -84,6 +90,9 @@ static char g_settings_text[8192];
 static TweakSettings g_settings;
 static int g_tick;
 static int g_logged_root;
+static int g_have_root;
+static int g_named_logs;
+static void *g_island_factory;
 static int g_logged_api;
 
 static int local_appdata(wchar_t *out, int cap);
@@ -115,7 +124,7 @@ static void log_line(const char *text) {
             g_log = _wfopen(path, L"a");
             if (g_log) {
                 fseek(g_log, 0, SEEK_END);
-                if (ftell(g_log) > 262144) {
+                if (ftell(g_log) > 1048576) {
                     fclose(g_log);
                     g_log = _wfopen(path, L"w");
                 }
@@ -203,6 +212,26 @@ static void copy_hstring(HSTRING hs, char *out, int cap) {
     if (!w) return;
     WideCharToMultiByte(CP_UTF8, 0, w, (int)len, out, cap - 1, NULL, NULL);
     out[cap - 1] = 0;
+}
+
+static void runtime_class(void *obj, char *out, int cap) {
+    HSTRING hs = NULL;
+    typedef long (*Fn)(void *, HSTRING *);
+    out[0] = 0;
+    void *insp = qi(obj, &IID_INSPECT);
+    if (!insp) return;
+    if (((Fn)slot(insp, VT_GET_CLASS_NAME))(insp, &hs) >= 0) copy_hstring(hs, out, cap);
+    if (hs) g_delete(hs);
+    rel(insp);
+}
+
+static const char *name_target(const char *name) {
+    if (!strcmp(name, "SidebarToggleButton")) return "hideSidebarButton";
+    if (!strcmp(name, "ChatButton")) return "hideChatButton";
+    if (!strcmp(name, "NavigationBarHost")) return "hideToolbar";
+    if (!strcmp(name, "ContentGroup") || !strcmp(name, "ContentHost") || !strcmp(name, "VariantHost")) return "edgeToEdge";
+    if (!strcmp(name, "AssistantPanelHost")) return "chat";
+    return NULL;
 }
 
 static void read_name(void *fe, char *out, int cap) {
@@ -338,6 +367,14 @@ static void walk(void *obj, int depth, const char *parent, int tree) {
     view.hasRadius = has_radius;
     view.width = width;
     view.height = height;
+    if (g_settings.dry && fe && (name[0] || has_radius) && g_named_logs < 100) {
+        char cn[160];
+        runtime_class(fe, cn, sizeof cn);
+        const char *tgt = name_target(name);
+        log_msg("element name=%s class=%s w=%.0f h=%.0f%s%s", name[0] ? name : "(unnamed)", cn[0] ? cn : "?", width, height,
+                tgt ? " target=" : "", tgt ? tgt : "");
+        if (++g_named_logs == 100) log_line("element dump truncated at 100");
+    }
     if (fe && tweak_interesting(&view)) {
         if (!border) border = qi(obj, &IID_BORDER);
         if (!control) control = qi(obj, &IID_CONTROL);
@@ -377,15 +414,31 @@ static void log_class_once(const wchar_t *cls) {
     log_msg("window class %s", utf);
 }
 
-static void *root_from_hwnd(HWND hwnd) {
-    wchar_t cls[128];
-    if (!GetClassNameW(hwnd, cls, 128) || class_skipped(cls)) return NULL;
-    log_class_once(cls);
-    void *raw = NULL;
-    if (g_acc(hwnd, 0xFFFFFFFC, &IID_RAW, &raw) < 0 || !raw) return NULL;
-    void *peer = qi(raw, &IID_PEER_OWNER);
+static void *owner_of_peer(void *peer) {
+    void *owner = NULL;
+    typedef long (*Fn)(void *, void **);
+    long hr = ((Fn)slot(peer, VT_GET_OWNER))(peer, &owner);
+    if (g_settings.dry || !g_have_root || hr < 0) log_msg("get_Owner hr=%08lx", (unsigned long)hr);
+    if (hr < 0) return NULL;
+    return owner;
+}
+
+static void *element_from_provider(void *provider, const char *via) {
+    if (!provider) return NULL;
+    char cn[160];
+    runtime_class(provider, cn, sizeof cn);
+    if (g_settings.dry || !g_have_root) log_msg("%s provider class=%s", via, cn[0] ? cn : "(not WinRT)");
+    void *direct = qi(provider, &IID_FE);
+    if (direct) {
+        char name[96];
+        read_name(direct, name, sizeof name);
+        if (g_settings.dry || !g_have_root)
+            log_msg("%s provider is FrameworkElement name=%s", via, name[0] ? name : "(unnamed)");
+        return direct;
+    }
+    void *peer = qi(provider, &IID_PEER_OWNER);
     if (!peer) {
-        void *as_peer = qi(raw, &IID_PEER);
+        void *as_peer = qi(provider, &IID_PEER);
         if (as_peer) {
             peer = qi(as_peer, &IID_PEER_OWNER);
             rel(as_peer);
@@ -393,29 +446,112 @@ static void *root_from_hwnd(HWND hwnd) {
     }
     if (!peer && ensure_api()) {
         if (!g_peer_factory) {
-            HSTRING name = NULL;
+            HSTRING hs = NULL;
             const wchar_t *cls_name = L"Microsoft.UI.Xaml.Automation.Peers.AutomationPeer";
-            if (g_create(cls_name, (unsigned)wcslen(cls_name), &name) >= 0) {
-                g_activate(name, &IID_PEER_PROTECTED, &g_peer_factory);
-                g_delete(name);
+            long hr = g_create(cls_name, (unsigned)wcslen(cls_name), &hs);
+            if (hr >= 0) {
+                hr = g_activate(hs, &IID_PEER_PROTECTED, &g_peer_factory);
+                g_delete(hs);
             }
+            if (!g_peer_factory && (g_settings.dry || !g_have_root))
+                log_msg("AutomationPeer factory hr=%08lx", (unsigned long)hr);
         }
         if (g_peer_factory) {
             void *made = NULL;
             typedef long (*Fn)(void *, void *, void **);
-            if (((Fn)slot(g_peer_factory, VT_PEER_FROM_PROVIDER))(g_peer_factory, raw, &made) >= 0 && made) {
+            long hr = ((Fn)slot(g_peer_factory, VT_PEER_FROM_PROVIDER))(g_peer_factory, provider, &made);
+            if (g_settings.dry || !g_have_root || hr < 0) log_msg("%s PeerFromProvider hr=%08lx", via, (unsigned long)hr);
+            if (hr >= 0 && made) {
                 peer = qi(made, &IID_PEER_OWNER);
-                if (!peer) peer = made;
-                else rel(made);
+                rel(made);
             }
         }
     }
-    rel(raw);
-    if (!peer) return NULL;
-    void *owner = NULL;
-    typedef long (*Fn)(void *, void **);
-    if (((Fn)slot(peer, VT_GET_OWNER))(peer, &owner) < 0) owner = NULL;
+    if (!peer) {
+        if (g_settings.dry || !g_have_root) log_msg("%s no FrameworkElementAutomationPeer", via);
+        return NULL;
+    }
+    void *owner = owner_of_peer(peer);
     rel(peer);
+    return owner;
+}
+
+static int islands_on_thread(void) {
+    if (!g_island_factory) {
+        HSTRING hs = NULL;
+        const wchar_t *cls = L"Microsoft.UI.Content.ContentIsland";
+        long hr = ensure_api() ? g_create(cls, (unsigned)wcslen(cls), &hs) : (long)0x80004005;
+        if (hr >= 0) {
+            hr = g_activate(hs, &IID_ISLAND_STATICS, &g_island_factory);
+            g_delete(hs);
+        }
+        if (g_settings.dry || !g_have_root)
+            log_msg("island factory hr=%08lx thread=%lu", (unsigned long)hr, GetCurrentThreadId());
+        if (hr < 0 || !g_island_factory) return 0;
+    }
+    unsigned int count = 0;
+    void **items = NULL;
+    typedef long (*Fn)(void *, unsigned int *, void ***);
+    long hr = ((Fn)slot(g_island_factory, VT_ISLAND_FIND_ALL))(g_island_factory, &count, &items);
+    if (g_settings.dry || !g_have_root || hr < 0)
+        log_msg("island FindAllForCurrentThread hr=%08lx count=%u thread=%lu", (unsigned long)hr, count,
+                GetCurrentThreadId());
+    if (hr < 0 || !items || count == 0 || count > 64) {
+        if (hr >= 0 && count > 64) log_msg("island count %u ignored", count);
+        if (items && count > 0 && count <= 64) {
+            for (unsigned int i = 0; i < count; i++) rel(items[i]);
+        }
+        if (items) CoTaskMemFree(items);
+        return 0;
+    }
+    int trees = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        void *island = items[i];
+        if (!island) continue;
+        unsigned long long id = 0;
+        typedef long (*FnId)(void *, unsigned long long *);
+        long id_hr = ((FnId)slot(island, VT_ISLAND_GET_ID))(island, &id);
+        void *provider = NULL;
+        typedef long (*FnProv)(void *, void **);
+        long prov_hr = ((FnProv)slot(island, VT_ISLAND_GET_PROVIDER))(island, &provider);
+        if (g_settings.dry || !g_have_root)
+            log_msg("island %u id_hr=%08lx id=%llx provider_hr=%08lx", i, (unsigned long)id_hr, id, (unsigned long)prov_hr);
+        if (prov_hr >= 0 && provider) {
+            char tag[32];
+            _snprintf(tag, sizeof tag, "island %u", i);
+            void *root = element_from_provider(provider, tag);
+            rel(provider);
+            if (root) {
+                char cn[160], name[96];
+                runtime_class(root, cn, sizeof cn);
+                read_name(root, name, sizeof name);
+                    if (g_settings.dry || !g_have_root)
+                        log_msg("island %u root class=%s name=%s", i, cn[0] ? cn : "?", name[0] ? name : "(unnamed)");
+                g_named_logs = 0;
+                walk(root, 0, "", trees++);
+                rel(root);
+            }
+        }
+        rel(island);
+    }
+    CoTaskMemFree(items);
+    return trees;
+}
+
+static void *root_from_hwnd(HWND hwnd) {
+    wchar_t cls[128];
+    if (!GetClassNameW(hwnd, cls, 128) || class_skipped(cls)) return NULL;
+    log_class_once(cls);
+    if (!g_acc) return NULL;
+    void *raw = NULL;
+    long hr = g_acc(hwnd, 0xFFFFFFFC, &IID_RAW, &raw);
+    char utf[128];
+    WideCharToMultiByte(CP_UTF8, 0, cls, -1, utf, sizeof utf, NULL, NULL);
+    if (g_settings.dry || hr < 0 || !raw)
+        log_msg("uia class=%s hwnd=%p acc hr=%08lx", utf, (void *)hwnd, (unsigned long)hr);
+    if (hr < 0 || !raw) return NULL;
+    void *owner = element_from_provider(raw, "uia");
+    rel(raw);
     return owner;
 }
 
@@ -454,31 +590,36 @@ static void rebuild(void) {
     g_cache_full = 0;
     if (!ensure_sta()) return;
 
-    WinList tops = {GetCurrentProcessId(), {0}, 0};
-    EnumWindows(collect_top, (LPARAM)&tops);
-    int trees = 0;
-    for (int i = 0; i < tops.count; i++) {
-        void *root = root_from_hwnd(tops.hwnds[i]);
-        if (!root) continue;
-        walk(root, 0, "", trees++);
-        rel(root);
-    }
+    g_named_logs = 0;
+    int trees = islands_on_thread();
     if (!trees) {
-        WinList children = {0, {0}, 0};
-        for (int i = 0; i < tops.count && children.count < 24; i++) EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
-        for (int i = 0; i < children.count; i++) {
-            void *root = root_from_hwnd(children.hwnds[i]);
+        WinList tops = {GetCurrentProcessId(), {0}, 0};
+        EnumWindows(collect_top, (LPARAM)&tops);
+        for (int i = 0; i < tops.count; i++) {
+            void *root = root_from_hwnd(tops.hwnds[i]);
             if (!root) continue;
             walk(root, 0, "", trees++);
             rel(root);
+        }
+        if (!trees) {
+            WinList children = {0, {0}, 0};
+            for (int i = 0; i < tops.count && children.count < 24; i++)
+                EnumChildWindows(tops.hwnds[i], collect_child, (LPARAM)&children);
+            for (int i = 0; i < children.count; i++) {
+                void *root = root_from_hwnd(children.hwnds[i]);
+                if (!root) continue;
+                walk(root, 0, "", trees++);
+                rel(root);
+            }
         }
     }
     if (!trees && !g_logged_root) {
         g_logged_root = 1;
         log_line("no WinUI root yet; toggles stay off until one appears");
-    } else if (trees && g_logged_root) {
+    } else if (trees) {
+        if (g_settings.dry || !g_have_root) log_msg("found %d WinUI root(s)", trees);
         g_logged_root = 0;
-        log_msg("found %d WinUI root(s)", trees);
+        g_have_root = 1;
     }
 
     for (int i = 0; i < g_nnext; i++) {
@@ -763,7 +904,9 @@ static void load_settings(void) {
 static void apply(void) {
     if (!g_host_ok || !ensure_sta()) return;
     load_settings();
-    if ((g_tick++ % 5) == 0 || g_ncache == 0) rebuild();
+    int rebuilt = (g_tick % 5) == 0 || g_ncache == 0;
+    g_tick++;
+    if (rebuilt) rebuild();
 
     Live lives[MAX_CACHE];
     int assistant = 0;
@@ -805,6 +948,14 @@ static void apply(void) {
         tweak_plan(&g_settings, &element, &plans[i]);
     }
     tweak_prefer_outer_inset(plans, depth, tree, g_ncache);
+    if (g_settings.dry && rebuilt) {
+        for (int i = 0; i < g_ncache; i++) {
+            if (!lives[i].ok || !tweak_plan_changes(&plans[i])) continue;
+            log_msg("plan %s visibility=%d margin=%d padding=%d radius=%d",
+                    g_cache[i].name[0] ? g_cache[i].name : "(unnamed)", plans[i].visibility, plans[i].setMargin,
+                    plans[i].setPadding, plans[i].setRadius);
+        }
+    }
     for (int i = 0; i < g_ncache; i++)
         if (lives[i].ok) apply_entry(&g_cache[i], &plans[i], &lives[i]);
 }
